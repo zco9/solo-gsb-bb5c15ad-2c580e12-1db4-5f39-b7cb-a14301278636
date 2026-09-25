@@ -127,6 +127,95 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(edge["ip"], "198.51.100.2")
 
 
+class PeerIpScopeTests(unittest.TestCase):
+    """对端 IP 只取自 from 子句（by 子句之前），按原文顺序识别。"""
+
+    def _ip(self, headers: str):
+        return analyze_headers(headers)["path"][0]["ip"]
+
+    def test_from_ipv6_not_overridden_by_by_ipv4(self):
+        # from 子句是 IPv6 对端、by 子句含 IPv4 接收服务器：
+        # 不得把接收服务器地址误记为对端 IP
+        headers = (
+            "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::1])\n"
+            "\tby mx.internal.example (10.0.0.1) with ESMTP; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "2001:db8::1")
+
+    def test_from_bracket_ipv6_not_overridden_by_by_bracket_ipv4(self):
+        headers = (
+            "Received: from v6.example ([2001:db8::7]) "
+            "by mx.example (mx.example [192.0.2.9]); "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "2001:db8::7")
+
+    def test_from_clause_scanned_in_text_order_v4_first(self):
+        headers = (
+            "Received: from a.example (a.example [203.0.113.1] [2001:db8::9]) "
+            "by b.example; Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "203.0.113.1")
+
+    def test_from_clause_scanned_in_text_order_v6_first(self):
+        headers = (
+            "Received: from a.example ([2001:db8::9] [203.0.113.1]) "
+            "by b.example; Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "2001:db8::9")
+
+    def test_by_clause_address_does_not_backfill(self):
+        # from 子句没有地址时保持空值，by 的 IPv4 字面量不回填
+        headers = (
+            "Received: from peer.example by 10.0.0.5 with ESMTP; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertIsNone(self._ip(headers))
+
+    def test_by_clause_comment_address_does_not_backfill(self):
+        headers = (
+            "Received: from peer.example by mx.example (mx.example [10.0.0.1]); "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertIsNone(self._ip(headers))
+
+    def test_no_from_clause_stays_empty(self):
+        headers = (
+            "Received: by mx.example (10.0.0.1); "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertIsNone(self._ip(headers))
+
+    def test_bare_ipv6_prefix_without_brackets(self):
+        headers = (
+            "Received: from IPv6:2001:db8::44 by mx.example; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "2001:db8::44")
+
+    def test_bare_ipv6_peer_host(self):
+        headers = (
+            "Received: from 2001:db8::33 by mx.example; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "2001:db8::33")
+
+    def test_by_word_inside_comment_does_not_truncate_from_clause(self):
+        headers = (
+            "Received: from a.example (relayed by b.example [203.0.113.8]) "
+            "by c.example; Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "203.0.113.8")
+
+    def test_invalid_ipv4_skipped_for_next_valid_address(self):
+        headers = (
+            "Received: from a.example (999.1.2.3 [2001:db8::6]) by b.example; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(self._ip(headers), "2001:db8::6")
+
+
 class ClockSkewTests(unittest.TestCase):
     def test_negative_delay_flags_warning(self):
         headers = (

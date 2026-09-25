@@ -5,7 +5,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mailtrace.parsing import build_share_report  # noqa: E402
+from mailtrace.parsing import analyze_headers, build_share_report  # noqa: E402
 from mailtrace.parsing.sample import SAMPLE_HEADERS  # noqa: E402
 
 try:  # Flask 相关测试在未安装 Flask 时跳过（解析核心仅需标准库）
@@ -169,6 +169,41 @@ class ShareReportTests(unittest.TestCase):
         report = build_share_report("Subject: hello\nFrom: a@b.c\n")
         self.assertIn("error", report)
         self.assertNotIn("path", report)
+
+    def test_only_corrected_peer_ip_gets_alias(self):
+        # from 子句是 IPv6 对端、by 子句含 IPv4 接收服务器：
+        # 报告只给修正后的对端 IPv6 分配别名，by 的 IPv4 不进入报告。
+        headers = (
+            "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::1])\n"
+            "\tby mx.internal.example (10.0.0.1) with ESMTP; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        analyzed = analyze_headers(headers)
+        self.assertEqual(analyzed["path"][0]["ip"], "2001:db8::1")
+
+        report = build_share_report(headers)
+        row = report["path"][0]
+        self.assertEqual(row["ip"], "IP1")
+        # 仅该对端 IP 占用别名；by 子句的接收服务器 IPv4 不出现也不占别名
+        self.assertEqual(report["ip_aliases"], ["IP1"])
+        blob = json.dumps(report, ensure_ascii=False)
+        self.assertNotIn("10.0.0.1", blob)
+        self.assertNotIn("2001:db8::1", blob)
+
+    def test_from_without_address_keeps_ip_empty(self):
+        # from 子句没有地址：by 子句里的接收服务器地址不回填，
+        # 报告 ip 留空，也不为 by 的地址分配 IP 别名
+        headers = (
+            "Received: from peer.example by mx.example (10.0.0.5) with ESMTP; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        report = build_share_report(headers)
+        row = report["path"][0]
+        self.assertIsNone(row["ip"])
+        self.assertEqual(report["ip_aliases"], [])
+        blob = json.dumps(report, ensure_ascii=False)
+        self.assertNotIn("10.0.0.5", blob)
+
 
 
 @unittest.skipIf(create_app is None, "未安装 Flask")

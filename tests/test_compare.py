@@ -158,6 +158,40 @@ class AlignmentTests(unittest.TestCase):
         result = compare_headers(headers_a + "\n", headers_b + "\n")
         self.assertEqual(result["alignment"]["common_count"], 1)
 
+    def test_by_clause_ipv4_does_not_pollute_peer_identity(self):
+        # 两侧 from 子句都是同一个 IPv6 对端，by 子句的 IPv4 接收服务器
+        # 地址不同：对端身份不受 by 地址影响，仍应配成同一跳。
+        headers_a = (
+            "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::1])\n"
+            "\tby mx.example (10.0.0.1) with ESMTP; Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        headers_b = (
+            "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::1])\n"
+            "\tby mx.example (10.0.0.2) with ESMTP; Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        result = compare_headers(headers_a, headers_b)
+        alignment = result["alignment"]
+        self.assertEqual(alignment["common_count"], 1)
+        row = result["alignment"]["rows"][0]
+        self.assertEqual(row["a"]["ip"], "2001:db8::1")
+        self.assertEqual(row["b"]["ip"], "2001:db8::1")
+
+    def test_from_clause_ipv6_conflict_prevents_match(self):
+        # by 主机相同、from 子句对端 IPv6 不同：任一冲突即不同节点。
+        headers_a = (
+            "Received: from v6peer.example ([2001:db8::1]) by mx.example; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        headers_b = (
+            "Received: from v6peer.example ([2001:db8::2]) by mx.example; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        result = compare_headers(headers_a, headers_b)
+        alignment = result["alignment"]
+        self.assertEqual(alignment["common_count"], 0)
+        self.assertEqual(alignment["missing_count"], 1)
+        self.assertEqual(alignment["added_count"], 1)
+
 
 class DelayCompareTests(unittest.TestCase):
     def test_common_nodes_show_both_delays_and_diff(self):

@@ -196,6 +196,26 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual(result["excluded"]["identity_less"], 2)
         self.assertEqual(result["segment_count"], 0)
 
+    def test_by_clause_ipv4_does_not_split_segment_identity(self):
+        # 两封邮件下游跳的 from 子句是同一个 IPv6 对端，by 子句各自带
+        # 不同的 IPv4 接收服务器地址：by 地址不进入节点身份，两封应
+        # 聚合为同一区段，且区段视图展示的是修正后的对端 IPv6。
+        def _mail(by_ipv4, seconds):
+            return (
+                "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::1])\n"
+                f"\tby mx.example ({by_ipv4}) with ESMTP; {_t(seconds)}\n"
+                + _received("edge.example", "203.0.113.9", _t(0), frm="sender.example")
+                + "\n"
+            )
+
+        result = batch_delay_analysis([_mail("10.0.0.1", 300), _mail("10.0.0.2", 600)])
+        self.assertEqual(result["segment_count"], 1)
+        segment = result["segments"][0]
+        self.assertEqual(segment["sample_count"], 2)
+        self.assertEqual(segment["median_seconds"], 450)
+        self.assertEqual(segment["to"]["by_host"], "mx.example")
+        self.assertEqual(segment["to"]["ip"], "2001:db8::1")
+
     def test_same_key_repeated_within_one_mail_takes_max_nonnegative(self):
         # 退信后发件方从同一 IP 重新注入：edge->mid 同键区段出现两次
         # （30s、150s）；中间与重注入形成 mid->edge 回流段（60s）；
