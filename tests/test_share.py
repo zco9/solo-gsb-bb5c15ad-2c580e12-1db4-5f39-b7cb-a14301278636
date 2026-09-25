@@ -144,6 +144,43 @@ class ShareReportTests(unittest.TestCase):
             any(a["level"] == "error" for a in second["anomalies"])
         )
 
+    def test_only_peer_ip_gets_ip_alias_when_by_has_ipv4(self):
+        # from 子句对端为 IPv6，by 子句含 IPv4 接收服务器：
+        # 只有对端 IP 取得 IP 别名；by 侧地址不进入 ip_aliases，也不泄漏
+        headers = (
+            "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::abcd])\n"
+            "\tby mx4.example (10.0.0.1) with ESMTP id SECRET-X; "
+            "Wed, 23 Sep 2026 02:01:00 +0000\n"
+            "Received: from sender.example (sender.example [198.51.100.5])\n"
+            "\tby v6peer.example with ESMTP id SECRET-Y; "
+            "Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        report = build_share_report(headers)
+        # 两个对端 IP 各一个 IP 别名；接收服务器 10.0.0.1 不在其中
+        self.assertEqual(report["ip_aliases"], ["IP1", "IP2"])
+        first, last = report["path"]
+        self.assertEqual(first["ip"], "IP1")       # 198.51.100.5
+        self.assertEqual(last["ip"], "IP2")        # 2001:db8::abcd
+        self.assertTrue(last["node"].startswith("H"))  # mx4 为主机名别名
+        blob = json.dumps(report, ensure_ascii=False)
+        for secret in ("10.0.0.1", "2001:db8::abcd", "198.51.100.5", "SECRET-X"):
+            self.assertNotIn(secret, blob)
+
+    def test_no_peer_ip_means_no_ip_alias_even_if_by_is_ip_literal(self):
+        headers = (
+            "Received: by 10.1.2.3 with ESMTP; "
+            "Wed, 23 Sep 2026 02:01:00 +0000\n"
+        )
+        report = build_share_report(headers)
+        # 无 from 对端：不分配任何 IP 别名；by 的地址字面量是接收主机
+        # 身份，仍以 H 别名掩码（原始值不得出现在报告中）
+        self.assertEqual(report["ip_aliases"], [])
+        row = report["path"][0]
+        self.assertIsNone(row["ip"])
+        self.assertEqual(row["node"], "H1")
+        self.assertEqual(report["host_aliases"], ["H1"])
+        self.assertNotIn("10.1.2.3", json.dumps(report))
+
     def test_report_is_whitelisted_and_anon(self):
         report = build_share_report(HEADERS)
         self.assertEqual(set(report.keys()), ALLOWED_TOP_KEYS)

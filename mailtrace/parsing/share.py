@@ -3,9 +3,11 @@
 设计要点：
 - 直接复用 :func:`mailtrace.parsing.parser.analyze_headers` 的解析结果
   （投递顺序、时间、相邻耗时、异常），不重复实现 Received 解析。
-- 按**投递顺序**（发件方 -> 收件方）为首次出现的不同主机名 / IP 分别
-  分配本次请求内稳定的别名：主机名 ``H1``、``H2``……，IP ``IP1``、
-  ``IP2``……。同一值（忽略主机名大小写与末尾点、剥去 ``[ ]`` 与
+- 按**投递顺序**（发件方 -> 收件方）为首次出现的不同主机名分配本次
+  请求内稳定的别名（``H1``、``H2``……）；IP 别名（``IP1``、
+  ``IP2``……）**只分配给解析器按 ``from`` 子句界定后提取的对端 IP**
+  （即每跳 ``ip`` 字段），``by`` 等其他位置出现的地址字面量不会获得
+  IP 别名。同一值（忽略主机名大小写与末尾点、剥去 ``[ ]`` 与
   Postfix 的 ``IPv6:`` 前缀）在节点、来源（from）与上一跳标签中
   始终得到同一个别名；缺失身份的节点对应字段留空（``None``）。
 - 输出采用白名单：仅包含路径序号、各类别名、UTC 时间、相邻耗时及
@@ -25,12 +27,12 @@ _HOST_PREFIX = "H"
 _IP_PREFIX = "IP"
 
 
-def _canon_value(value: str | None) -> tuple[str, bool] | None:
-    """把标签值规范化为 ``(查表键, 是否为 IP)``；无身份时返回 ``None``。
+def _canon_host(value: str | None) -> str | None:
+    """把主机名标签规范化为查表键；IP 字面量或无身份时返回 ``None``。
 
     主机名忽略大小写与末尾点（与 compare/batch 的规范化一致）；
-    方括号字面量与 ``IPv6:`` / ``IPv4:`` 前缀会被剥去后按 IP 校验，
-    因此 ``[10.0.0.5]`` 与解析出的 ``10.0.0.5`` 命中同一 IP 别名。
+    方括号字面量与 ``IPv6:`` / ``IPv4:`` 前缀剥去后能按 IP 校验的值
+    不由主机名表处理（交由 :func:`_host_alias` 查 IP 别名表）。
     """
     if not value:
         return None
@@ -43,9 +45,25 @@ def _canon_value(value: str | None) -> tuple[str, bool] | None:
     if not token or token == UNKNOWN_NODE:
         return None
     try:
-        return str(ip_address(token)), True
+        ip_address(token)
     except ValueError:
-        return token.lower(), False
+        return token.lower()
+    return None
+
+
+def _canon_ip(value: str | None) -> str | None:
+    """把对端 IP 规范化为查表键；非合法 IP / 空值时返回 ``None``。"""
+    if not value:
+        return None
+    token = value.strip()
+    if len(token) >= 2 and token.startswith("[") and token.endswith("]"):
+        token = token[1:-1].strip()
+    if token.lower().startswith(("ipv6:", "ipv4:")):
+        token = token[5:]
+    try:
+        return str(ip_address(token))
+    except ValueError:
+        return None
 
 
 def build_share_report(raw_headers: str) -> dict:
@@ -60,27 +78,52 @@ def build_share_report(raw_headers: str) -> dict:
     host_aliases: dict[str, str] = {}
     ip_aliases: dict[str, str] = {}
 
-    def alias_for(value: str | None) -> str | None:
-        canon = _canon_value(value)
-        if canon is None:
-            return None
-        key, is_ip = canon
-        table = ip_aliases if is_ip else host_aliases
-        prefix = _IP_PREFIX if is_ip else _HOST_PREFIX
-        alias = table.get(key)
+    # 仅解析器确认的对端 IP 可以取得 IP 别名；先按投递顺序登记，
+    # 保证 IP1、IP2…… 的编号即对端在路径中的出现顺序。
+    for hop in result["path"]:
+        key = _canon_ip(hop.get("ip"))
+        if key is not None and key not in ip_aliases:
+            ip_aliases[key] = f"{_IP_PREFIX}{len(ip_aliases) + 1}"
+
+    def host_alias(value: str | None) -> str | None:
+        """节点 / 来源 / 上一跳标签的别名：
+
+        若标签本身是已登记对端 IP 的字面量（如 ``[10.0.0.5]`` 与该跳
+        对端 IP 同源），沿用其 IP 别名；其余标签（包括作为接收主机
+        身份出现的地址字面量）按主机名分配 H 别名——IP 别名表只对
+        解析器确认的对端 IP 开放。
+        """
+        ip_key = _canon_ip(value)
+        if ip_key is not None:
+            peer_alias = ip_aliases.get(ip_key)
+            if peer_alias is not None:
+                return peer_alias
+        key = _canon_host(value)
+        if key is None:
+            if ip_key is not None:
+                # 非对端 IP 的地址字面量（如 by 10.1.2.3）：
+                # 不分配 IP 别名，但仍以 H 别名掩码并保留节点身份
+                key = f"ip:{ip_key}"
+            else:
+                return None
+        alias = host_aliases.get(key)
         if alias is None:
-            alias = f"{prefix}{len(table) + 1}"
-            table[key] = alias
+            alias = f"{_HOST_PREFIX}{len(host_aliases) + 1}"
+            host_aliases[key] = alias
         return alias
+
+    def peer_ip_alias(value: str | None) -> str | None:
+        key = _canon_ip(value)
+        return ip_aliases.get(key) if key is not None else None
 
     rows: list[dict] = []
     for hop in result["path"]:
         # 注册顺序即投递顺序；同一跳内先节点、再来源、再对端 IP
-        node_alias = alias_for(hop.get("node"))
-        from_alias = alias_for(hop.get("from_host"))
-        ip_alias = alias_for(hop.get("ip"))
+        node_alias = host_alias(hop.get("node"))
+        from_alias = host_alias(hop.get("from_host"))
+        ip_alias = peer_ip_alias(hop.get("ip"))
         # 上一跳标签与上一节点的节点别名天然一致（值相同、表共享）
-        delay_from_alias = alias_for(hop.get("delay_from"))
+        delay_from_alias = host_alias(hop.get("delay_from"))
 
         rows.append(
             {

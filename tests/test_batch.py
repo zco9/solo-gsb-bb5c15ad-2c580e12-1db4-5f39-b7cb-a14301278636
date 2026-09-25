@@ -359,6 +359,31 @@ class AggregationTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertEqual(result["segment_count"], 0)
 
+    def test_ipv4_in_by_clause_does_not_pollute_segment_identity(self):
+        # 两封走同一区段、by 侧恰好同为 IPv4 字面量接收服务器、
+        # 但 from 对端 IPv6 不同：不得把 10.0.0.1 回填为对端 IP
+        # 而错误合并成同一节点身份。
+        def mail(peer_v6, second_offset):
+            return (
+                "Received: from v6peer.example (v6peer.example [IPv6:%s])\n"
+                "\tby mx4.example (10.0.0.1) with ESMTP; "
+                "Wed, 23 Sep 2026 02:0%d:00 +0000\n"
+                "Received: from sender.example (sender.example [198.51.100.5])\n"
+                "\tby v6peer.example with ESMTP; "
+                "Wed, 23 Sep 2026 02:0%d:00 +0000\n"
+                % (peer_v6, 2 + second_offset, 1 + second_offset)
+            )
+
+        result = batch_delay_analysis(
+            [mail("2001:db8::1", 0), mail("2001:db8::2", 10)]
+        )
+        # 两个终到节点的对端 IP 不同 -> 两个不同区段，各自一个样本
+        self.assertEqual(result["segment_count"], 2)
+        peer_ips = {seg["to"]["ip"] for seg in result["segments"]}
+        self.assertEqual(peer_ips, {"2001:db8::1", "2001:db8::2"})
+        for seg in result["segments"]:
+            self.assertNotEqual(seg["to"]["ip"], "10.0.0.1")
+
 
 class SampleBatchTests(unittest.TestCase):
     def test_sample_batch_split_into_three(self):

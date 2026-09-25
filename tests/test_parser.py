@@ -159,6 +159,66 @@ class IpAndTzTests(unittest.TestCase):
         result = analyze_headers(headers)
         self.assertEqual(result["path"][0]["ip"], "2001:db8::2")
 
+    def test_ipv6_peer_in_from_not_confused_by_ipv4_by(self):
+        # from 子句为 IPv6 对端、by 子句注释里是 IPv4 接收服务器时，
+        # 不得把 by 侧的 IPv4 误记为对端 IP
+        headers = (
+            "Received: from v6peer.example (v6peer.example [IPv6:2001:db8::abcd])\n"
+            "\tby mx4.example (10.0.0.1) with ESMTP id XYZ; "
+            "Wed, 23 Sep 2026 02:01:00 +0000\n"
+        )
+        hop = analyze_headers(headers)["path"][0]
+        self.assertEqual(hop["from_host"], "v6peer.example")
+        self.assertEqual(hop["by_host"], "mx4.example")
+        self.assertEqual(hop["ip"], "2001:db8::abcd")
+
+    def test_bare_prefixed_ipv6_without_brackets(self):
+        headers = (
+            "Received: from h.example (h.example IPv6:2001:db8::9)\n"
+            "\tby mx.example with ESMTP; Wed, 23 Sep 2026 02:00:00 +0000\n"
+        )
+        self.assertEqual(
+            analyze_headers(headers)["path"][0]["ip"], "2001:db8::9"
+        )
+
+    def test_first_ip_in_from_clause_wins_by_text_order(self):
+        # IPv6 在前取 IPv6，IPv4 在前取 IPv4（不再固定优先 IPv4）
+        v6_first = (
+            "Received: from h ([IPv6:2001:db8::1] [198.51.100.7])\n"
+            "\tby mx.example; Wed, 23 Sep 2026 02:04:00 +0800\n"
+        )
+        v4_first = (
+            "Received: from h ([198.51.100.7] [IPv6:2001:db8::1])\n"
+            "\tby mx.example; Wed, 23 Sep 2026 02:04:00 +0800\n"
+        )
+        self.assertEqual(analyze_headers(v6_first)["path"][0]["ip"], "2001:db8::1")
+        self.assertEqual(analyze_headers(v4_first)["path"][0]["ip"], "198.51.100.7")
+
+    def test_ipv4_in_by_clause_not_backfilled_as_peer(self):
+        headers = (
+            "Received: from relay.example\n"
+            "\tby 10.20.30.40 with ESMTP; Wed, 23 Sep 2026 02:04:00 +0800\n"
+        )
+        hop = analyze_headers(headers)["path"][0]
+        self.assertEqual(hop["by_host"], "10.20.30.40")
+        self.assertIsNone(hop["ip"])
+
+    def test_by_only_hop_has_no_peer_ip(self):
+        headers = (
+            "Received: by final.example (127.0.0.1) with ESMTPS id AAA; "
+            "Wed, 23 Sep 2026 10:05:00 +0800\n"
+        )
+        self.assertIsNone(analyze_headers(headers)["path"][0]["ip"])
+
+    def test_keyword_inside_comment_does_not_truncate_from_clause(self):
+        headers = (
+            "Received: from h.example (verified by someone [2001:db8::5])\n"
+            "\tby mx.example; Wed, 23 Sep 2026 02:04:00 +0800\n"
+        )
+        self.assertEqual(
+            analyze_headers(headers)["path"][0]["ip"], "2001:db8::5"
+        )
+
     def test_naive_timestamp_warns_but_still_timed(self):
         headers = (
             "Received: by mx.example; Wed, 23 Sep 2026 02:00:00\n"

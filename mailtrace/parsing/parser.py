@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from ipaddress import IPv4Address, IPv6Address, ip_address
+from ipaddress import ip_address
 
 # RFC 5322 字段名：可打印 ASCII，不含空白与冒号
 _HEADER_NAME_RE = re.compile(r"^([\x21-\x39\x3B-\x7E]+):[ \t]?(.*)$")
@@ -23,6 +23,8 @@ _WS_RUN_RE = re.compile(r"[ \t]+")
 _IPV4_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\d.])")
 # 方括号内的裸 IPv6（常见于 helo 注释，如 [2001:db8::1] 或 [IPv6:2001:db8::1])
 _IPV6_BRACKET_RE = re.compile(r"\[([0-9a-fA-F:]{3,}|IPv[46]:[0-9a-fA-F:]{3,})\]")
+# 不在方括号内、带 Postfix "IPv6:" / "IPv4:" 前缀的地址
+_IP_PREFIXED_RE = re.compile(r"(?<![\w.])(IPv[46]:[0-9a-fA-F:.]{2,})(?![\w.])", re.IGNORECASE)
 # 不在方括号内的裸 IPv6（兜底）
 _IPV6_BARE_RE = re.compile(r"(?<![:\w])([0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![:\w])")
 _FROM_RE = re.compile(r"\bfrom\s+(\S+)", re.IGNORECASE)
@@ -212,40 +214,105 @@ def parse_received_date(date_raw: str) -> tuple[datetime | None, bool]:
     return None, False
 
 
-def _valid_ip(token: str, version: int):
-    """剥离 Postfix 的 ``IPv6:`` / ``IPv4:`` 前缀后校验地址。"""
+def _valid_ip(token: str):
+    """剥离 Postfix 的 ``IPv6:`` / ``IPv4:`` 前缀后校验为合法 IP。
+
+    合法时返回规范化字符串（由 :mod:`ipaddress` 给出），否则返回 ``None``；
+    不限制地址族，调用方按返回值族属自行区分。
+    """
     token = token.strip()
     for prefix in ("IPv6:", "IPv4:", "ipv6:", "ipv4:"):
         if token.startswith(prefix):
             token = token[len(prefix):]
             break
     try:
-        ip = ip_address(token)
+        return str(ip_address(token))
     except ValueError:
         return None
-    if version == 4 and isinstance(ip, IPv4Address):
-        return str(ip)
-    if version == 6 and isinstance(ip, IPv6Address):
-        return str(ip)
-    return None
 
 
-def _find_ip(text: str) -> str | None:
-    """在 Received 的“分号前”部分中找出对端 IP（优先 IPv4，其次 IPv6）。"""
-    cleaned = _strip_paren_comments(text)
-    # 保留原文与去注释两份文本：IP 常出现在注释或方括号中
-    sources = (text, cleaned)
+def _from_clause_span(received_part: str) -> tuple[int, int] | None:
+    """界定 Received 分号前部分中 ``from`` 子句（对端信息）的字符范围。
 
-    for version, patterns in (
-        (4, (_IPV4_RE,)),
-        (6, (_IPV6_BRACKET_RE, _IPV6_BARE_RE)),
+    起点为独立单词 ``from`` 之后；终点为后续任一 ``by`` / ``with`` /
+    ``via`` / ``id`` / ``for`` 子句关键词（取最靠前者）的起点，没有
+    后续关键词时延伸到文本末尾。圆括号注释或方括号字面量内的词
+    （如 ``(verified by ...)``、注释里的 ``from``）不参与关键词识别。
+    返回偏移针对**原文**（IP 提取仍在原文切片上进行，以保留注释 /
+    方括号中的地址）；``from`` 子句不存在时返回 ``None``——对端 IP
+    只允许取自该子句。
+    """
+    # 屏蔽圆括号注释与方括号字面量，再在干净文本上定位子句关键词
+    masked_chars = list(received_part)
+    for cm in re.finditer(r"\([^()]*\)|\[[^\[\]]*\]", received_part):
+        for i in range(cm.start(), cm.end()):
+            masked_chars[i] = " "
+    masked = "".join(masked_chars)
+
+    m_from = re.search(r"(?<![\w.-])from(?![\w.-])", masked, re.IGNORECASE)
+    if m_from is None:
+        return None
+
+    start = m_from.end()
+    end = len(received_part)
+    m_boundary = re.search(
+        r"(?<![\w.-])(?:by|with|via|id|for)(?![\w.-])",
+        masked[start:],
+        re.IGNORECASE,
+    )
+    if m_boundary is not None:
+        end = start + m_boundary.start()
+    return start, end
+
+
+def _ip_candidates_in_order(text: str):
+    """按原文出现顺序产出文本中的合法 IP（同时识别 IPv4 与 IPv6）。
+
+    支持裸 IPv4、方括号内 IPv6（``[2001:db8::1]``、``[IPv6:...]``）、
+    带 Postfix ``IPv6:`` / ``IPv4:`` 前缀的地址与不在方括号内的裸
+    IPv6。多个模式在同一位置重叠（方括号/前缀/裸地址）时只保留一次。
+    """
+    found_spans: list[tuple[int, int, str]] = []
+    for pattern in (
+        _IPV6_BRACKET_RE,
+        _IP_PREFIXED_RE,
+        _IPV4_RE,
+        _IPV6_BARE_RE,
     ):
-        for source in sources:
-            for pattern in patterns:
-                for m in pattern.finditer(source):
-                    found = _valid_ip(m.group(1), version)
-                    if found:
-                        return found
+        for m in pattern.finditer(text):
+            ip = _valid_ip(m.group(1))
+            if ip is None:
+                continue
+            span = m.span(1)
+            if not any(
+                span[0] >= s0 and span[1] <= s1 for s0, s1, _ in found_spans
+            ):
+                found_spans.append((span[0], span[1], ip))
+
+    found_spans.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+    # 排序后仍可能存在交叉（不同起点的重叠匹配），保留靠前的一个
+    result: list[str] = []
+    last_end = -1
+    for start, end, ip in found_spans:
+        if start >= last_end:
+            result.append(ip)
+            last_end = end
+    return result
+
+
+def _find_peer_ip(received_part: str) -> str | None:
+    """提取对端 IP：只在 ``from`` 子句范围内、按原文顺序识别。
+
+    取 ``from`` 子句中第一个合法 IP（IPv4 / IPv6 不设优先级）；
+    ``by`` 及其后子句（with/via/id/for）中的地址不会被当作对端 IP；
+    ``from`` 子句不存在或其中没有合法 IP 时返回 ``None``。
+    """
+    span = _from_clause_span(received_part)
+    if span is None:
+        return None
+    start, end = span
+    for ip in _ip_candidates_in_order(received_part[start:end]):
+        return ip
     return None
 
 
@@ -293,7 +360,7 @@ def _build_hop(block: HeaderBlock) -> Hop:
     hop.via = _first_match(_VIA_RE, search_text)
     hop.with_proto = _first_match(_WITH_RE, search_text)
     hop.received_id = _first_match(_ID_RE, search_text)
-    hop.ip = _find_ip(received_part)
+    hop.ip = _find_peer_ip(received_part)
     return hop
 
 

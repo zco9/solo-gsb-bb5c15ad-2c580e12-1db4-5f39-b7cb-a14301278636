@@ -195,6 +195,24 @@ class TrustBoundaryTests(unittest.TestCase):
         self.assertEqual(result["hops"][0]["path_index"], 5)
         self.assertEqual(result["hops"][-1]["path_index"], 1)
 
+    def test_external_handoff_ip_ignores_ipv4_in_by_clause(self):
+        # 最后可信跳 from 对端是 IPv6、by 注释里是 IPv4 接收服务器：
+        # 外部交接点 IP 必须是 from 子句的 IPv6，而非 by 侧 10.0.0.1
+        headers = (
+            "Received: from edge.example (edge.example [IPv6:2001:db8::1])\n"
+            "\tby edge.org (10.0.0.1) with ESMTP; "
+            "Thu, 24 Sep 2026 03:01:00 +0000\n"
+            "Received: from sender.example (sender.example [198.51.100.9])\n"
+            "\tby edge.example with ESMTP; "
+            "Thu, 24 Sep 2026 03:00:00 +0000\n"
+        )
+        result = analyze_trust_boundary(headers, ["edge.org"])
+        self.assertEqual(result["status"], "established")
+        handoff = result["last_trusted_hop"]
+        self.assertEqual(handoff["from_host"], "edge.example")
+        self.assertEqual(handoff["ip"], "2001:db8::1")
+        self.assertNotEqual(handoff["ip"], "10.0.0.1")
+
 
 @unittest.skipIf(create_app is None, "Flask 未安装")
 class TrustApiTests(unittest.TestCase):

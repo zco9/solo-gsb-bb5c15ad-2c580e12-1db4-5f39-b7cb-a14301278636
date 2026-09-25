@@ -126,6 +126,26 @@ class AlignmentTests(unittest.TestCase):
         self.assertEqual(alignment["missing_count"], 1)
         self.assertEqual(alignment["added_count"], 1)
 
+    def test_ipv4_in_by_clause_not_used_as_peer_identity(self):
+        # from 对端为 IPv6、by 注释里为同一台 IPv4 接收服务器：
+        # 两份头部应按 IPv6 对端 + by 主机配成同一跳，
+        # 而不是两侧都把 by 侧 10.0.0.1 误当对端 IP 而“碰巧一致”。
+        def headers(peer_v6):
+            return (
+                "Received: from v6peer.example (v6peer.example [IPv6:%s])\n"
+                "\tby mx4.example (10.0.0.1) with ESMTP; "
+                "Wed, 23 Sep 2026 02:00:00 +0000\n" % peer_v6
+            )
+
+        same = compare_headers(headers("2001:db8::1"), headers("2001:db8::1"))
+        self.assertEqual(same["alignment"]["common_count"], 1)
+        common = same["alignment"]["rows"][0]
+        self.assertEqual(common["a"]["ip"], "2001:db8::1")
+        self.assertEqual(common["b"]["ip"], "2001:db8::1")
+
+        diff = compare_headers(headers("2001:db8::1"), headers("2001:db8::2"))
+        self.assertEqual(diff["alignment"]["common_count"], 0)
+
     def test_case_and_trailing_dot_insensitive_host_match(self):
         headers_a = _received(
             "MX.Example.", "192.0.2.1", "Wed, 23 Sep 2026 02:00:00 +0000"
